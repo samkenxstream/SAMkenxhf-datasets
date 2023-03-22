@@ -71,6 +71,7 @@ from .features.features import (
     FeatureType,
     _align_features,
     _check_if_features_can_be_aligned,
+    generate_from_arrow_type,
     pandas_types_mapper,
     require_decoding,
 )
@@ -97,6 +98,7 @@ from .table import (
     InMemoryTable,
     MemoryMappedTable,
     Table,
+    cast_array_to_feature,
     concat_tables,
     embed_table_storage,
     list_table_cache_files,
@@ -106,8 +108,6 @@ from .table import (
 )
 from .tasks import TaskTemplate
 from .utils import logging
-from .utils._hf_hub_fixes import create_repo
-from .utils._hf_hub_fixes import list_repo_files as hf_api_list_repo_files
 from .utils.file_utils import _retry, cached_path, estimate_dataset_size
 from .utils.hub import hf_hub_url
 from .utils.info_utils import is_small_dataset
@@ -857,18 +857,31 @@ class Dataset(DatasetInfoMixin, IndexableMixin, TensorflowDatasetMixin):
                 f"Features specified in `features` and `info.features` can't be different:\n{features}\n{info.features}"
             )
         features = features if features is not None else info.features if info is not None else None
+        arrow_typed_mapping = {}
+        for col, data in mapping.items():
+            if isinstance(data, (pa.Array, pa.ChunkedArray)):
+                data = cast_array_to_feature(data, features[col]) if features is not None else data
+            else:
+                data = OptimizedTypedSequence(
+                    features.encode_column(data, col) if features is not None else data,
+                    type=features[col] if features is not None else None,
+                    col=col,
+                )
+            arrow_typed_mapping[col] = data
+        mapping = arrow_typed_mapping
+        pa_table = InMemoryTable.from_pydict(mapping=mapping)
         if info is None:
             info = DatasetInfo()
         info.features = features
-        if features is not None:
-            mapping = features.encode_batch(mapping)
-        mapping = {
-            col: OptimizedTypedSequence(data, type=features[col] if features is not None else None, col=col)
-            for col, data in mapping.items()
-        }
-        pa_table = InMemoryTable.from_pydict(mapping=mapping)
         if info.features is None:
-            info.features = Features({col: ts.get_inferred_type() for col, ts in mapping.items()})
+            info.features = Features(
+                {
+                    col: generate_from_arrow_type(data.type)
+                    if isinstance(data, (pa.Array, pa.ChunkedArray))
+                    else data.get_inferred_type()
+                    for col, data in mapping.items()
+                }
+            )
         return cls(pa_table, info=info, split=split)
 
     @classmethod
@@ -2292,7 +2305,7 @@ class Dataset(DatasetInfoMixin, IndexableMixin, TensorflowDatasetMixin):
             drop_last_batch (:obj:`bool`, default `False`): Whether a last batch smaller than the batch_size should be
                 dropped
         """
-        if self._indices is None and config.PYARROW_VERSION.major >= 8:
+        if self._indices is None:
             # Fast iteration
             # Benchmark: https://gist.github.com/mariosasko/0248288a2e3a7556873969717c1fe52b (fast_iter_batch)
             format_kwargs = self._format_kwargs if self._format_kwargs is not None else {}
@@ -5067,8 +5080,7 @@ class Dataset(DatasetInfoMixin, IndexableMixin, TensorflowDatasetMixin):
             organization_or_username = api.whoami(token)["name"]
             repo_id = f"{organization_or_username}/{dataset_name}"
 
-        create_repo(
-            api,
+        api.create_repo(
             repo_id,
             token=token,
             repo_type="dataset",
@@ -5110,7 +5122,7 @@ class Dataset(DatasetInfoMixin, IndexableMixin, TensorflowDatasetMixin):
 
             shards = shards_with_embedded_external_files(shards)
 
-        files = hf_api_list_repo_files(api, repo_id, repo_type="dataset", revision=branch, use_auth_token=token)
+        files = api.list_repo_files(repo_id, repo_type="dataset", revision=branch, token=token)
         data_files = [file for file in files if file.startswith("data/")]
 
         def path_in_repo(_index, shard):
@@ -5271,8 +5283,11 @@ class Dataset(DatasetInfoMixin, IndexableMixin, TensorflowDatasetMixin):
             )
             dataset_metadata = DatasetMetadata.from_readme(Path(dataset_readme_path))
             dataset_infos: DatasetInfosDict = DatasetInfosDict.from_metadata(dataset_metadata)
-            repo_info = dataset_infos[next(iter(dataset_infos))]
-        # get the deprecated dataset_infos.json to uodate them
+            if dataset_infos:
+                repo_info = dataset_infos[next(iter(dataset_infos))]
+            else:
+                repo_info = None
+        # get the deprecated dataset_infos.json to update them
         elif config.DATASETDICT_INFOS_FILENAME in repo_files:
             dataset_metadata = DatasetMetadata()
             download_config = DownloadConfig()
@@ -5284,7 +5299,10 @@ class Dataset(DatasetInfoMixin, IndexableMixin, TensorflowDatasetMixin):
             )
             with open(dataset_infos_path, encoding="utf-8") as f:
                 dataset_infos: DatasetInfosDict = json.load(f)
-                repo_info = DatasetInfo.from_dict(dataset_infos[next(iter(dataset_infos))])
+                if dataset_infos:
+                    repo_info = DatasetInfo.from_dict(dataset_infos[next(iter(dataset_infos))])
+                else:
+                    repo_info = None
         else:
             dataset_metadata = DatasetMetadata()
             repo_info = None

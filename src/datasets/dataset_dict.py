@@ -1172,7 +1172,7 @@ class DatasetDict(dict):
                 The maximum size of the dataset shards to be uploaded to the hub. If expressed as a string, needs to be digits followed by a unit
                 (like `"50MB"`).
             num_shards (`Dict[str, int]`, *optional*):
-                Number of shards to write. By default the number of shards depends on `max_shard_size`.
+                Number of shards to write. By default the number of shards depends on `max_shard_size` and `num_proc`.
                 You need to provide the number of shards for each dataset in the dataset dictionary.
                 Use a dictionary to define a different num_shards for each split.
 
@@ -1217,6 +1217,8 @@ class DatasetDict(dict):
 
         if is_local:
             Path(dataset_dict_path).resolve().mkdir(parents=True, exist_ok=True)
+        else:
+            fs.makedirs(dataset_dict_path, exist_ok=True)
 
         with fs.open(path_join(dataset_dict_path, config.DATASETDICT_JSON_FILENAME), "w", encoding="utf-8") as f:
             json.dump({"splits": list(self)}, f)

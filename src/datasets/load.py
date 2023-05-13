@@ -368,6 +368,7 @@ def infer_module_for_data_files(
                 return _EXTENSION_TO_MODULE[ext]
             elif ext == "zip":
                 return infer_module_for_data_files_in_archives(data_files_list, use_auth_token=use_auth_token)
+    return None, {}
 
 
 def infer_module_for_data_files_in_archives(
@@ -404,6 +405,7 @@ def infer_module_for_data_files_in_archives(
         most_common = extensions_counter.most_common(1)[0][0]
         if most_common in _EXTENSION_TO_MODULE:
             return _EXTENSION_TO_MODULE[most_common]
+    return None, {}
 
 
 @dataclass
@@ -632,14 +634,14 @@ class LocalDatasetModuleFactoryWithoutScript(_DatasetModuleFactory):
             base_path=base_path,
             allowed_extensions=ALL_ALLOWED_EXTENSIONS,
         )
-        module_names = {
-            key: infer_module_for_data_files(data_files_list) for key, data_files_list in data_files.items()
+        split_modules = {
+            split: infer_module_for_data_files(data_files_list) for split, data_files_list in data_files.items()
         }
-        if len(set(list(zip(*module_names.values()))[0])) > 1:
-            raise ValueError(f"Couldn't infer the same data file format for all splits. Got {module_names}")
-        module_name, builder_kwargs = next(iter(module_names.values()))
+        module_name, builder_kwargs = next(iter(split_modules.values()))
+        if any((module_name, builder_kwargs) != split_module for split_module in split_modules.values()):
+            raise ValueError(f"Couldn't infer the same data file format for all splits. Got {split_modules}")
         if not module_name:
-            raise FileNotFoundError(f"No data files or dataset script found in {self.path}")
+            raise FileNotFoundError(f"No (supported) data files or dataset script found in {self.path}")
         # Collect metadata files if the module supports them
         if self.data_files is None and module_name in _MODULE_SUPPORTS_METADATA and patterns != DEFAULT_PATTERNS_ALL:
             try:
@@ -701,7 +703,9 @@ class PackagedDatasetModuleFactory(_DatasetModuleFactory):
         increase_load_count(name, resource_type="dataset")
 
     def get_module(self) -> DatasetModule:
-        base_path = str(Path(self.data_dir).resolve()) if self.data_dir is not None else str(Path().resolve())
+        base_path = (
+            str(Path(self.data_dir).expanduser().resolve()) if self.data_dir is not None else str(Path().resolve())
+        )
         patterns = (
             sanitize_patterns(self.data_files) if self.data_files is not None else get_data_patterns_locally(base_path)
         )
@@ -770,15 +774,15 @@ class HubDatasetModuleFactoryWithoutScript(_DatasetModuleFactory):
             base_path=self.data_dir,
             allowed_extensions=ALL_ALLOWED_EXTENSIONS,
         )
-        module_names = {
-            key: infer_module_for_data_files(data_files_list, use_auth_token=self.download_config.use_auth_token)
-            for key, data_files_list in data_files.items()
+        split_modules = {
+            split: infer_module_for_data_files(data_files_list, use_auth_token=self.download_config.use_auth_token)
+            for split, data_files_list in data_files.items()
         }
-        if len(set(list(zip(*module_names.values()))[0])) > 1:
-            raise ValueError(f"Couldn't infer the same data file format for all splits. Got {module_names}")
-        module_name, builder_kwargs = next(iter(module_names.values()))
+        module_name, builder_kwargs = next(iter(split_modules.values()))
+        if any((module_name, builder_kwargs) != split_module for split_module in split_modules.values()):
+            raise ValueError(f"Couldn't infer the same data file format for all splits. Got {split_modules}")
         if not module_name:
-            raise FileNotFoundError(f"No data files or dataset script found in {self.name}")
+            raise FileNotFoundError(f"No (supported) data files or dataset script found in {self.name}")
         # Collect metadata files if the module supports them
         if self.data_files is None and module_name in _MODULE_SUPPORTS_METADATA and patterns != DEFAULT_PATTERNS_ALL:
             try:
@@ -1409,6 +1413,7 @@ def load_dataset_builder(
     download_mode: Optional[Union[DownloadMode, str]] = None,
     revision: Optional[Union[str, Version]] = None,
     use_auth_token: Optional[Union[bool, str]] = None,
+    storage_options: Optional[Dict] = None,
     **config_kwargs,
 ) -> DatasetBuilder:
     """Load a dataset builder from the Hugging Face Hub, or a local dataset. A dataset builder can be used to inspect general information that is required to build a dataset (cache directory, config, dataset info, etc.)
@@ -1469,6 +1474,10 @@ def load_dataset_builder(
         use_auth_token (`str` or `bool`, *optional*):
             Optional string or boolean to use as Bearer token for remote files on the Datasets Hub.
             If `True`, or not specified, will get token from `"~/.huggingface"`.
+        storage_options (`dict`, *optional*, defaults to `None`):
+            **Experimental**. Key/value pairs to be passed on to the dataset file-system backend, if any.
+
+            <Added version="2.11.0"/>
         **config_kwargs (additional keyword arguments):
             Keyword arguments to be passed to the [`BuilderConfig`]
             and used in the [`DatasetBuilder`].
@@ -1524,6 +1533,7 @@ def load_dataset_builder(
         hash=hash,
         features=features,
         use_auth_token=use_auth_token,
+        storage_options=storage_options,
         **builder_kwargs,
         **config_kwargs,
     )
@@ -1550,6 +1560,7 @@ def load_dataset(
     task: Optional[Union[str, TaskTemplate]] = None,
     streaming: bool = False,
     num_proc: Optional[int] = None,
+    storage_options: Optional[Dict] = None,
     **config_kwargs,
 ) -> Union[DatasetDict, Dataset, IterableDatasetDict, IterableDataset]:
     """Load a dataset from the Hugging Face Hub, or a local dataset.
@@ -1671,6 +1682,10 @@ def load_dataset(
             Multiprocessing is disabled by default.
 
             <Added version="2.7.0"/>
+        storage_options (`dict`, *optional*, defaults to `None`):
+            **Experimental**. Key/value pairs to be passed on to the dataset file-system backend, if any.
+
+            <Added version="2.11.0"/>
         **config_kwargs (additional keyword arguments):
             Keyword arguments to be passed to the `BuilderConfig`
             and used in the [`DatasetBuilder`].
@@ -1729,12 +1744,14 @@ def load_dataset(
     ```
     """
     if ignore_verifications != "deprecated":
-        verification_mode = "none" if ignore_verifications else "full"
+        verification_mode = VerificationMode.NO_CHECKS if ignore_verifications else VerificationMode.ALL_CHECKS
         warnings.warn(
             "'ignore_verifications' was deprecated in favor of 'verification_mode' in version 2.9.1 and will be removed in 3.0.0.\n"
-            "To ignore verifications, you can pass `verification_mode='no_checks'` instead.",
+            f"You can remove this warning by passing 'verification_mode={verification_mode.value}' instead.",
             FutureWarning,
         )
+    if data_files is not None and not data_files:
+        raise ValueError(f"Empty 'data_files': '{data_files}'. It should be either non-empty or None (default).")
     if Path(path, config.DATASET_STATE_JSON_FILENAME).exists():
         raise ValueError(
             "You are trying to load a dataset that was saved using `save_to_disk`. "
@@ -1764,6 +1781,7 @@ def load_dataset(
         download_mode=download_mode,
         revision=revision,
         use_auth_token=use_auth_token,
+        storage_options=storage_options,
         **config_kwargs,
     )
 
@@ -1782,6 +1800,7 @@ def load_dataset(
         verification_mode=verification_mode,
         try_from_hf_gcs=try_from_hf_gcs,
         num_proc=num_proc,
+        storage_options=storage_options,
     )
 
     # Build dataset for splits

@@ -168,16 +168,9 @@ class NumpyArrowExtractor(BaseArrowExtractor[dict, np.ndarray, dict]):
             if isinstance(pa_array.type, _ArrayXDExtensionType):
                 # don't call to_pylist() to preserve dtype of the fixed-size array
                 zero_copy_only = _is_zero_copy_only(pa_array.type.storage_dtype, unnest=True)
-                if pa_array.type.shape[0] is None:
-                    array: List = [
-                        row
-                        for chunk in pa_array.chunks
-                        for row in chunk.to_list_of_numpy(zero_copy_only=zero_copy_only)
-                    ]
-                else:
-                    array: List = [
-                        row for chunk in pa_array.chunks for row in chunk.to_numpy(zero_copy_only=zero_copy_only)
-                    ]
+                array: List = [
+                    row for chunk in pa_array.chunks for row in chunk.to_numpy(zero_copy_only=zero_copy_only)
+                ]
             else:
                 zero_copy_only = _is_zero_copy_only(pa_array.type) and all(
                     not _is_array_with_nulls(chunk) for chunk in pa_array.chunks
@@ -189,10 +182,7 @@ class NumpyArrowExtractor(BaseArrowExtractor[dict, np.ndarray, dict]):
             if isinstance(pa_array.type, _ArrayXDExtensionType):
                 # don't call to_pylist() to preserve dtype of the fixed-size array
                 zero_copy_only = _is_zero_copy_only(pa_array.type.storage_dtype, unnest=True)
-                if pa_array.type.shape[0] is None:
-                    array: List = pa_array.to_list_of_numpy(zero_copy_only=zero_copy_only)
-                else:
-                    array: List = pa_array.to_numpy(zero_copy_only=zero_copy_only)
+                array: List = pa_array.to_numpy(zero_copy_only=zero_copy_only)
             else:
                 zero_copy_only = _is_zero_copy_only(pa_array.type) and not _is_array_with_nulls(pa_array)
                 array: List = pa_array.to_numpy(zero_copy_only=zero_copy_only).tolist()
@@ -218,7 +208,7 @@ class PandasArrowExtractor(BaseArrowExtractor[pd.DataFrame, pd.Series, pd.DataFr
 
 
 class PythonFeaturesDecoder:
-    def __init__(self, features: Features):
+    def __init__(self, features: Optional[Features]):
         self.features = features
 
     def decode_row(self, row: dict) -> dict:
@@ -232,7 +222,7 @@ class PythonFeaturesDecoder:
 
 
 class PandasFeaturesDecoder:
-    def __init__(self, features: Features):
+    def __init__(self, features: Optional[Features]):
         self.features = features
 
     def decode_row(self, row: pd.DataFrame) -> pd.DataFrame:
@@ -396,7 +386,7 @@ class Formatter(Generic[RowFormat, ColumnFormat, BatchFormat]):
     numpy_arrow_extractor = NumpyArrowExtractor
     pandas_arrow_extractor = PandasArrowExtractor
 
-    def __init__(self, features=None):
+    def __init__(self, features: Optional[Features] = None):
         self.features = features
         self.python_features_decoder = PythonFeaturesDecoder(self.features)
         self.pandas_features_decoder = PandasFeaturesDecoder(self.features)

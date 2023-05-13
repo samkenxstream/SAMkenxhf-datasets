@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Dict, Iterable, Mapping, Optional, Tuple, Union
 
 import fsspec
+import pyarrow as pa
 from multiprocess import Pool
 from tqdm.contrib.concurrent import thread_map
 
@@ -50,9 +51,12 @@ from .dataset_dict import DatasetDict, IterableDatasetDict
 from .download.download_config import DownloadConfig
 from .download.download_manager import DownloadManager, DownloadMode
 from .download.mock_download_manager import MockDownloadManager
-from .download.streaming_download_manager import StreamingDownloadManager
+from .download.streaming_download_manager import StreamingDownloadManager, xopen
 from .features import Features
-from .filesystems import is_remote_filesystem
+from .filesystems import (
+    is_remote_filesystem,
+    rename,
+)
 from .fingerprint import Hasher
 from .info import DatasetInfo, DatasetInfosDict, PostProcessedInfo
 from .iterable_dataset import ExamplesIterable, IterableDataset, _generate_examples_from_tables_wrapper
@@ -105,11 +109,15 @@ class BuilderConfig:
 
     Attributes:
         name (`str`, defaults to `default`):
-        version (`Version` or `str`, *optional*):
+            The name of the configuration.
+        version (`Version` or `str`, defaults to `0.0.0`):
+            The version of the configuration.
         data_dir (`str`, *optional*):
+            Path to the directory containing the source data.
         data_files (`str` or `Sequence` or `Mapping`, *optional*):
             Path(s) to source data file(s).
         description (`str`, *optional*):
+            A human description of the configuration.
     """
 
     name: str = "default"
@@ -251,6 +259,8 @@ class DatasetBuilder:
             `os.path.join(data_dir, "**")` as `data_files`.
             For builders that require manual download, it must be the path to the local directory containing the
             manually downloaded data.
+        storage_options (`dict`, *optional*):
+            Key/value pairs to be passed on to the dataset file-system backend, if any.
         writer_batch_size (`int`, *optional*):
             Batch size used by the ArrowWriter.
             It defines the number of samples that are kept in memory before writing them
@@ -299,6 +309,7 @@ class DatasetBuilder:
         repo_id: Optional[str] = None,
         data_files: Optional[Union[str, list, dict, DataFilesDict]] = None,
         data_dir: Optional[str] = None,
+        storage_options: Optional[dict] = None,
         writer_batch_size: Optional[int] = None,
         name="deprecated",
         **config_kwargs,
@@ -315,6 +326,7 @@ class DatasetBuilder:
         self.base_path = base_path
         self.use_auth_token = use_auth_token
         self.repo_id = repo_id
+        self.storage_options = storage_options
         self._writer_batch_size = writer_batch_size or self.DEFAULT_WRITER_BATCH_SIZE
 
         if data_files is not None and not isinstance(data_files, DataFilesDict):
@@ -616,12 +628,7 @@ class DatasetBuilder:
         return os.path.dirname(inspect.getfile(inspect.getmodule(cls)))
 
     def _rename(self, src: str, dst: str):
-        is_local = not is_remote_filesystem(self._fs)
-        if is_local:
-            # LocalFileSystem.mv does copy + rm, it is more efficient to simply move a local directory
-            shutil.move(self._fs._strip_protocol(src), self._fs._strip_protocol(dst))
-        else:
-            self._fs.mv(src, dst, recursive=True)
+        rename(self._fs, src, dst)
 
     def download_and_prepare(
         self,
@@ -778,6 +785,7 @@ class DatasetBuilder:
                     use_etag=False,
                     num_proc=num_proc,
                     use_auth_token=use_auth_token,
+                    storage_options=self.storage_options,
                 )  # We don't use etag for data files to speed up the process
 
             dl_manager = DownloadManager(
@@ -1240,9 +1248,6 @@ class DatasetBuilder:
         split: Optional[str] = None,
         base_path: Optional[str] = None,
     ) -> Union[Dict[str, IterableDataset], IterableDataset]:
-        if not isinstance(self, (GeneratorBasedBuilder, ArrowBasedBuilder)):
-            raise ValueError(f"Builder {self.name} is not streamable.")
-
         is_local = not is_remote_filesystem(self._fs)
         if not is_local:
             raise NotImplementedError(
@@ -1251,7 +1256,7 @@ class DatasetBuilder:
 
         dl_manager = StreamingDownloadManager(
             base_path=base_path or self.base_path,
-            download_config=DownloadConfig(use_auth_token=self.use_auth_token),
+            download_config=DownloadConfig(use_auth_token=self.use_auth_token, storage_options=self.storage_options),
             dataset_name=self.name,
             data_dir=self.config.data_dir,
         )
@@ -1482,13 +1487,14 @@ class GeneratorBasedBuilder(DatasetBuilder):
             result = None
             gen_kwargs = split_generator.gen_kwargs
             job_id = 0
-            for job_id, done, content in self._prepare_split_single(
-                gen_kwargs=gen_kwargs, job_id=job_id, **_prepare_split_args
-            ):
-                if done:
-                    result = content
-                else:
-                    pbar.update(content)
+            with pbar:
+                for job_id, done, content in self._prepare_split_single(
+                    gen_kwargs=gen_kwargs, job_id=job_id, **_prepare_split_args
+                ):
+                    if done:
+                        result = content
+                    else:
+                        pbar.update(content)
             # wrapping everything into lists for consistency with the multiprocessed code path
             assert result is not None, "Failed to retrieve results from prepare_split"
             examples_per_job, bytes_per_job, features_per_job, shards_per_job, shard_lengths_per_job = [
@@ -1510,21 +1516,22 @@ class GeneratorBasedBuilder(DatasetBuilder):
             shard_lengths_per_job = [None] * num_jobs
 
             with Pool(num_proc) as pool:
-                for job_id, done, content in iflatmap_unordered(
-                    pool, self._prepare_split_single, kwargs_iterable=kwargs_per_job
-                ):
-                    if done:
-                        # the content is the result of the job
-                        (
-                            examples_per_job[job_id],
-                            bytes_per_job[job_id],
-                            features_per_job[job_id],
-                            shards_per_job[job_id],
-                            shard_lengths_per_job[job_id],
-                        ) = content
-                    else:
-                        # the content is the number of examples progress update
-                        pbar.update(content)
+                with pbar:
+                    for job_id, done, content in iflatmap_unordered(
+                        pool, self._prepare_split_single, kwargs_iterable=kwargs_per_job
+                    ):
+                        if done:
+                            # the content is the result of the job
+                            (
+                                examples_per_job[job_id],
+                                bytes_per_job[job_id],
+                                features_per_job[job_id],
+                                shards_per_job[job_id],
+                                shard_lengths_per_job[job_id],
+                            ) = content
+                        else:
+                            # the content is the number of examples progress update
+                            pbar.update(content)
 
             assert (
                 None not in examples_per_job
@@ -2076,3 +2083,60 @@ class BeamBasedBuilder(DatasetBuilder):
 
         # Add the PCollection to the pipeline
         _ = pipeline | split_name >> _build_pcollection()  # pylint: disable=no-value-for-parameter max_bytes_per_shard
+
+    def as_streaming_dataset(
+        self,
+        split: Optional[str] = None,
+    ) -> Union[Dict[str, IterableDataset], IterableDataset]:
+        self._request_info_from_hf_gcs()
+        datasets = {
+            split.name: IterableDataset(self._get_examples_iterable_for_split(split), info=self.info, split=split.name)
+            for split in self.info.splits.values()
+        }
+        if split:
+            try:
+                datasets = datasets[split]
+            except KeyError:
+                raise ValueError(f"Bad split: {split}. Available splits: {list(datasets)}")
+        if isinstance(datasets, dict):
+            datasets = IterableDatasetDict(datasets)
+        return datasets
+
+    def _get_examples_iterable_for_split(self, split: SplitInfo) -> ExamplesIterable:
+        return ExamplesIterable(self._generate_examples_from_hf_gcs, {"split": split})
+
+    def _generate_examples_from_hf_gcs(self, split: SplitInfo):
+        if split.shard_lengths:
+            num_shards = len(split.shard_lengths)
+            remote_prepared_urls = [
+                f"{self._remote_cache_dir_from_hf_gcs}/{self.name}-{split.name}-{shard_id:05d}-of-{num_shards:05d}.arrow"
+                for shard_id in range(num_shards)
+            ]
+        else:
+            remote_prepared_urls = [f"{self._remote_cache_dir_from_hf_gcs}/{self.name}-{split.name}.arrow"]
+        key = 0
+        for remote_prepared_url in remote_prepared_urls:
+            with xopen(remote_prepared_url, "rb") as f:
+                with pa.ipc.open_stream(f) as reader:
+                    for record_batch in reader:
+                        for record in record_batch.to_pylist():
+                            yield key, record
+                            key += 1
+
+    def _request_info_from_hf_gcs(self):
+        from .download.streaming_download_manager import xopen
+
+        remote_dataset_info = f"{self._remote_cache_dir_from_hf_gcs}/{config.DATASET_INFO_FILENAME}"
+        try:
+            with xopen(remote_dataset_info) as f:
+                import json
+
+                _info = json.load(f)
+        except FileNotFoundError as err:
+            raise DatasetNotOnHfGcsError(err) from None
+        self.info.update(DatasetInfo.from_dict(_info))
+
+    @property
+    def _remote_cache_dir_from_hf_gcs(self):
+        relative_data_dir = self._relative_data_dir(with_hash=False)
+        return HF_GCP_BASE_URL + "/" + relative_data_dir.replace(os.sep, "/")

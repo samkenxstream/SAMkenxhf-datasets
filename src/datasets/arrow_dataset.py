@@ -115,7 +115,7 @@ from .utils.metadata import DatasetMetadata
 from .utils.py_utils import Literal, asdict, convert_file_size_to_int, iflatmap_unordered, unique_values
 from .utils.stratify import stratified_shuffle_split_generate_indices
 from .utils.tf_utils import dataset_to_tf, minimal_tf_collate_fn, multiprocess_dataset_to_tf
-from .utils.typing import PathLike
+from .utils.typing import ListLike, PathLike
 
 
 if TYPE_CHECKING:
@@ -1226,11 +1226,13 @@ class Dataset(DatasetInfoMixin, IndexableMixin, TensorflowDatasetMixin):
         df: "pyspark.sql.DataFrame",
         split: Optional[NamedSplit] = None,
         features: Optional[Features] = None,
+        keep_in_memory: bool = False,
         cache_dir: str = None,
+        working_dir: str = None,
         load_from_cache_file: bool = True,
         **kwargs,
     ):
-        """Create Dataset from Spark DataFrame. Dataset downloading is distributed over Spark workers.
+        """Create a Dataset from Spark DataFrame. Dataset downloading is distributed over Spark workers.
 
         Args:
             df (`pyspark.sql.DataFrame`):
@@ -1242,6 +1244,11 @@ class Dataset(DatasetInfoMixin, IndexableMixin, TensorflowDatasetMixin):
             cache_dir (`str`, *optional*, defaults to `"~/.cache/huggingface/datasets"`):
                 Directory to cache data. When using a multi-node Spark cluster, the cache_dir must be accessible to both
                 workers and the driver.
+            keep_in_memory (`bool`):
+                Whether to copy the data in-memory.
+            working_dir (`str`, *optional*)
+                Intermediate directory for each Spark worker to write data to before moving it to `cache_dir`. Setting
+                a non-NFS intermediate directory may improve performance.
             load_from_cache_file (`bool`):
                 Whether to load the dataset from the cache if possible.
 
@@ -1262,13 +1269,16 @@ class Dataset(DatasetInfoMixin, IndexableMixin, TensorflowDatasetMixin):
         from .io.spark import SparkDatasetReader
 
         if sys.platform == "win32":
-            raise EnvironmentError("Datasets.from_spark is not currently supported on Windows")
+            raise EnvironmentError("Dataset.from_spark is not currently supported on Windows")
 
         return SparkDatasetReader(
             df,
             split=split,
             features=features,
+            streaming=False,
             cache_dir=cache_dir,
+            keep_in_memory=keep_in_memory,
+            working_dir=working_dir,
             load_from_cache_file=load_from_cache_file,
             **kwargs,
         ).read()
@@ -2742,10 +2752,12 @@ class Dataset(DatasetInfoMixin, IndexableMixin, TensorflowDatasetMixin):
         dataset = dataset.cast(features=template.features)
         return dataset
 
-    def _getitem(self, key: Union[int, slice, str], **kwargs) -> Union[Dict, List]:
+    def _getitem(self, key: Union[int, slice, str, ListLike[int]], **kwargs) -> Union[Dict, List]:
         """
-        Can be used to index columns (by string names) or rows (by integer index, slices, or iter of indices or bools)
+        Can be used to index columns (by string names) or rows (by integer, slice, or list-like of integer indices)
         """
+        if isinstance(key, bool):
+            raise TypeError("dataset index must be int, str, slice or collection of int, not bool")
         format_type = kwargs["format_type"] if "format_type" in kwargs else self._format_type
         format_columns = kwargs["format_columns"] if "format_columns" in kwargs else self._format_columns
         output_all_columns = (
